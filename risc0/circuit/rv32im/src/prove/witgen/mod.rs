@@ -174,16 +174,46 @@ where
                     }
                 }
                 Back::Sha2(sha2_state) => {
-                    for (col, value) in zip(Sha2State::fp_offsets(), sha2_state.fp_array()) {
-                        injector.set(row, col, value);
+                    // Batch SHA2 FP state updates
+                    let fp_offsets = Sha2State::fp_offsets();
+                    let fp_values = sha2_state.fp_array();
+
+                    injector.offsets.reserve(fp_offsets.len());
+                    injector.values.reserve(fp_values.len());
+
+                    for (&col, &value) in zip(&fp_offsets, &fp_values) {
+                        let idx = col * injector.rows + row;
+                        injector.offsets.push(idx as u32);
+                        injector.values.push(value.into());
                     }
-                    for (col, value) in zip(Sha2State::u32_offsets(), sha2_state.u32_array()) {
-                        injector.set_u32_bits(row, col, value);
+
+                    // Batch SHA2 U32 bit operations
+                    let u32_offsets = Sha2State::u32_offsets();
+                    let u32_values = sha2_state.u32_array();
+
+                    injector.offsets.reserve(u32_offsets.len() * 32);
+                    injector.values.reserve(u32_values.len() * 32);
+
+                    for (&col, &value) in zip(&u32_offsets, &u32_values) {
+                        for i in 0..32 {
+                            let idx = (col + i) * injector.rows + row;
+                            injector.offsets.push(idx as u32);
+                            injector.values.push(((value >> i) & 1).into());
+                        }
                     }
                 }
                 Back::BigInt(state) => {
-                    for (col, value) in zip(BigIntState::offsets(), state.as_array()) {
-                        injector.set(row, col, value);
+                    // Batch BigInt state updates
+                    let offsets = BigIntState::offsets();
+                    let values = state.as_array();
+
+                    injector.offsets.reserve(offsets.len());
+                    injector.values.reserve(values.len());
+
+                    for (&col, &value) in zip(&offsets, &values) {
+                        let idx = col * injector.rows + row;
+                        injector.offsets.push(idx as u32);
+                        injector.values.push(value.into());
                     }
                 }
             }
@@ -308,10 +338,19 @@ impl Injector {
     fn new(rows: usize) -> Self {
         let mut index = Vec::with_capacity(rows + 1);
         index.push(0);
+
+        // Estimate capacity based on typical workload:
+        // - Each cycle does at least 5 operations (set_cycle)
+        // - Poseidon2: ~25 operations
+        // - SHA2: ~32+ FP operations + 32*N bit operations
+        // - BigInt: ~16 operations
+        // Conservative estimate: 100 operations per cycle on average
+        let estimated_ops = rows * 100;
+
         Self {
             rows,
-            offsets: vec![],
-            values: vec![],
+            offsets: Vec::with_capacity(estimated_ops),
+            values: Vec::with_capacity(estimated_ops),
             index,
         }
     }
@@ -338,18 +377,6 @@ impl Injector {
         let idx = col * self.rows + row;
         self.offsets.push(idx as u32);
         self.values.push(value.into());
-    }
-
-    fn set_u32_bits(&mut self, row: usize, col: usize, value: u32) {
-        // Reserve capacity for 32 elements to avoid reallocations
-        self.offsets.reserve(32);
-        self.values.reserve(32);
-
-        for i in 0..32 {
-            let idx = (col + i) * self.rows + row;
-            self.offsets.push(idx as u32);
-            self.values.push(((value >> i) & 1).into());
-        }
     }
 }
 
