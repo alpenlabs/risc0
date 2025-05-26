@@ -158,8 +158,19 @@ where
                     injector.set(row, ECALL_S2, *s2);
                 }
                 Back::Poseidon2(p2_state) => {
-                    for (col, value) in zip(Poseidon2State::offsets(), p2_state.as_array()) {
-                        injector.set(row, col, value);
+                    // Batch Poseidon2 state updates for better performance
+                    let offsets = Poseidon2State::offsets();
+                    let values = p2_state.as_array();
+
+                    // Reserve capacity for all Poseidon2 elements at once
+                    injector.offsets.reserve(offsets.len());
+                    injector.values.reserve(values.len());
+
+                    // Batch compute and push all updates
+                    for (&col, &value) in zip(&offsets, &values) {
+                        let idx = col * injector.rows + row;
+                        injector.offsets.push(idx as u32);
+                        injector.values.push(value.into());
                     }
                 }
                 Back::Sha2(sha2_state) => {
@@ -330,8 +341,14 @@ impl Injector {
     }
 
     fn set_u32_bits(&mut self, row: usize, col: usize, value: u32) {
+        // Reserve capacity for 32 elements to avoid reallocations
+        self.offsets.reserve(32);
+        self.values.reserve(32);
+
         for i in 0..32 {
-            self.set(row, col + i, (value >> i) & 1);
+            let idx = (col + i) * self.rows + row;
+            self.offsets.push(idx as u32);
+            self.values.push(((value >> i) & 1).into());
         }
     }
 }
