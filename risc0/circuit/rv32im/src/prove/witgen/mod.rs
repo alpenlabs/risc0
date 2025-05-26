@@ -51,7 +51,30 @@ use crate::{
     },
 };
 
-use rayon::prelude::*;
+// Lookup table for bit expansion - precomputed for all 256 possible byte values
+static BIT_LOOKUP: [[u32; 8]; 256] = {
+    let mut table = [[0u32; 8]; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut j = 0;
+        while j < 8 {
+            table[i][j] = if i & (1 << j) != 0 { 1 } else { 0 };
+            j += 1;
+        }
+        i += 1;
+    }
+    table
+};
+
+// Fast bit unpacking using lookup table
+fn unpack_u32_bits_fast(value: u32) -> [u32; 32] {
+    let mut result = [0u32; 32];
+    result[0..8].copy_from_slice(&BIT_LOOKUP[(value & 0xFF) as usize]);
+    result[8..16].copy_from_slice(&BIT_LOOKUP[((value >> 8) & 0xFF) as usize]);
+    result[16..24].copy_from_slice(&BIT_LOOKUP[((value >> 16) & 0xFF) as usize]);
+    result[24..32].copy_from_slice(&BIT_LOOKUP[((value >> 24) & 0xFF) as usize]);
+    result
+}
 
 pub(crate) struct WitnessGenerator<H: Hal> {
     cycles: usize,
@@ -140,110 +163,60 @@ where
             MetaBuffer::new("data", hal, cycles, REGCOUNT_DATA, true)
         );
 
-        // Set stateful columns from 'top' - parallel processing
-        let injector_data: Vec<(usize, Vec<u32>, Vec<Val>)> = trace.backs.par_iter().enumerate()
-            .map(|(row, back)| {
-                let cycle = &trace.cycles[row];
-                let mut offsets: Vec<u32> = Vec::new();
-                let mut values: Vec<Val> = Vec::new();
+                // Set stateful columns from 'top' - optimized sequential processing
+        let mut injector = FastInjector::new(cycles);
+        for (row, back) in trace.backs.iter().enumerate() {
+            let cycle = &trace.cycles[row];
+            match back {
+                Back::None => {}
+                Back::Ecall(s0, s1, s2) => {
+                    const ECALL_S0: usize = LAYOUT_TOP.inst_result.arm8.s0._super.offset;
+                    const ECALL_S1: usize = LAYOUT_TOP.inst_result.arm8.s1._super.offset;
+                    const ECALL_S2: usize = LAYOUT_TOP.inst_result.arm8.s2._super.offset;
 
-                // Process the specific back type
-                match back {
-                    Back::None => {}
-                    Back::Ecall(s0, s1, s2) => {
-                        const ECALL_S0: usize = LAYOUT_TOP.inst_result.arm8.s0._super.offset;
-                        const ECALL_S1: usize = LAYOUT_TOP.inst_result.arm8.s1._super.offset;
-                        const ECALL_S2: usize = LAYOUT_TOP.inst_result.arm8.s2._super.offset;
+                    injector.push_single(row, ECALL_S0, *s0);
+                    injector.push_single(row, ECALL_S1, *s1);
+                    injector.push_single(row, ECALL_S2, *s2);
+                }
+                Back::Poseidon2(p2_state) => {
+                    let p2_offsets = Poseidon2State::offsets();
+                    let p2_values = p2_state.as_array();
 
-                        let idx_s0 = (ECALL_S0 * cycles + row) as u32;
-                        let idx_s1 = (ECALL_S1 * cycles + row) as u32;
-                        let idx_s2 = (ECALL_S2 * cycles + row) as u32;
+                    injector.push_batch(row, &p2_offsets, &p2_values);
+                }
+                Back::Sha2(sha2_state) => {
+                    let fp_offsets = Sha2State::fp_offsets();
+                    let fp_values = sha2_state.fp_array();
+                    let u32_offsets = Sha2State::u32_offsets();
+                    let u32_values = sha2_state.u32_array();
 
-                        offsets.extend([idx_s0, idx_s1, idx_s2]);
-                        values.push((*s0).into());
-                        values.push((*s1).into());
-                        values.push((*s2).into());
-                    }
-                    Back::Poseidon2(p2_state) => {
-                        let p2_offsets = Poseidon2State::offsets();
-                        let p2_values = p2_state.as_array();
+                    injector.push_batch(row, &fp_offsets, &fp_values);
 
-                        for (&col, &value) in zip(&p2_offsets, &p2_values) {
-                            let idx = (col * cycles + row) as u32;
-                            offsets.push(idx);
-                            values.push(value.into());
-                        }
-                    }
-                    Back::Sha2(sha2_state) => {
-                        // SHA2 FP operations
-                        let fp_offsets = Sha2State::fp_offsets();
-                        let fp_values = sha2_state.fp_array();
-
-                        for (&col, &value) in zip(&fp_offsets, &fp_values) {
-                            let idx = (col * cycles + row) as u32;
-                            offsets.push(idx);
-                            values.push(value.into());
-                        }
-
-                        // SHA2 U32 bit operations
-                        let u32_offsets = Sha2State::u32_offsets();
-                        let u32_values = sha2_state.u32_array();
-
-                        for (&col, &value) in zip(&u32_offsets, &u32_values) {
-                            for i in 0..32 {
-                                let idx = ((col + i) * cycles + row) as u32;
-                                offsets.push(idx);
-                                values.push(((value >> i) & 1).into());
-                            }
-                        }
-                    }
-                    Back::BigInt(state) => {
-                        let bigint_offsets = BigIntState::offsets();
-                        let bigint_values = state.as_array();
-
-                        for (&col, &value) in zip(&bigint_offsets, &bigint_values) {
-                            let idx = (col * cycles + row) as u32;
-                            offsets.push(idx);
-                            values.push(value.into());
-                        }
+                    for (&col, &value) in zip(&u32_offsets, &u32_values) {
+                        injector.push_u32_bits_fast(row, col, value);
                     }
                 }
+                Back::BigInt(state) => {
+                    let bigint_offsets = BigIntState::offsets();
+                    let bigint_values = state.as_array();
 
-                // Add cycle data
-                const CYCLE_COL: usize = LAYOUT_TOP.cycle._super.offset;
-                const NEXT_PC_LOW: usize = LAYOUT_TOP.next_pc_low._super.offset;
-                const NEXT_PC_HIGH: usize = LAYOUT_TOP.next_pc_high._super.offset;
-                const NEXT_STATE: usize = LAYOUT_TOP.next_state_0._super.offset;
-                const NEXT_MACHINE_MODE: usize = LAYOUT_TOP.next_machine_mode._super.offset;
+                    injector.push_batch(row, &bigint_offsets, &bigint_values);
+                }
+            }
 
-                let cycle_offsets = [
-                    (CYCLE_COL * cycles + row) as u32,
-                    (NEXT_PC_LOW * cycles + row) as u32,
-                    (NEXT_PC_HIGH * cycles + row) as u32,
-                    (NEXT_STATE * cycles + row) as u32,
-                    (NEXT_MACHINE_MODE * cycles + row) as u32,
-                ];
+            // Add cycle data
+            const CYCLE_COL: usize = LAYOUT_TOP.cycle._super.offset;
+            const NEXT_PC_LOW: usize = LAYOUT_TOP.next_pc_low._super.offset;
+            const NEXT_PC_HIGH: usize = LAYOUT_TOP.next_pc_high._super.offset;
+            const NEXT_STATE: usize = LAYOUT_TOP.next_state_0._super.offset;
+            const NEXT_MACHINE_MODE: usize = LAYOUT_TOP.next_machine_mode._super.offset;
 
-                let cycle_values = [
-                    Val::from(row as u32),
-                    Val::from(cycle.pc & 0xffff),
-                    Val::from(cycle.pc >> 16),
-                    Val::from(cycle.state),
-                    Val::from(cycle.machine_mode as u32),
-                ];
+            injector.push_single(row, CYCLE_COL, row as u32);
+            injector.push_single(row, NEXT_PC_LOW, cycle.pc & 0xffff);
+            injector.push_single(row, NEXT_PC_HIGH, cycle.pc >> 16);
+            injector.push_single(row, NEXT_STATE, cycle.state);
+            injector.push_single(row, NEXT_MACHINE_MODE, cycle.machine_mode as u32);
 
-                offsets.extend(cycle_offsets);
-                values.extend(cycle_values);
-
-                (row, offsets, values)
-            })
-            .collect();
-
-        // Merge parallel results into injector
-        let mut injector = Injector::new(cycles);
-        for (row, row_offsets, row_values) in injector_data {
-            injector.offsets.extend(row_offsets);
-            injector.values.extend(row_values);
             injector.push();
         }
 
@@ -315,7 +288,7 @@ where
         let last_mix = ExtVal::from_subelems(mix[mix.len() - 4..].iter().cloned());
 
         // inject BigIntAccumState backs
-        let mut injector = Injector::new(self.cycles);
+        let mut injector = FastInjector::new(self.cycles);
         let mut bigint_accum = BigIntAccum::new(last_mix);
 
         for (row, back) in self.trace.backs.iter().enumerate() {
@@ -323,7 +296,7 @@ where
                 bigint_accum.step(state)?;
                 for (col, value) in zip(BigIntAccumState::offsets(), bigint_accum.state.as_array())
                 {
-                    injector.set(row, col, value);
+                    injector.push_single(row, col, value);
                 }
                 injector.push();
             }
@@ -354,25 +327,25 @@ where
 }
 
 #[derive(Debug)]
-struct Injector {
+struct FastInjector {
     rows: usize,
     offsets: Vec<u32>,
     values: Vec<Val>,
     index: Vec<u32>,
 }
 
-impl Injector {
+impl FastInjector {
     fn new(rows: usize) -> Self {
         let mut index = Vec::with_capacity(rows + 1);
         index.push(0);
 
-        // Estimate capacity based on typical workload:
-        // - Each cycle does at least 5 operations (set_cycle)
-        // - Poseidon2: ~25 operations
-        // - SHA2: ~32+ FP operations + 32*N bit operations
-        // - BigInt: ~16 operations
-        // Conservative estimate: 100 operations per cycle on average
-        let estimated_ops = rows * 100;
+        // Pre-allocate much larger capacity based on worst-case analysis:
+        // - Poseidon2: 25 elements
+        // - SHA2: ~50 FP + up to 1000+ bit operations (32 bits * N u32 values)
+        // - BigInt: ~16 elements
+        // - Cycle data: 5 elements
+        // Estimate: 1500 operations per cycle worst case
+        let estimated_ops = rows * 1500;
 
         Self {
             rows,
@@ -386,12 +359,35 @@ impl Injector {
         self.index.push(self.offsets.len() as u32);
     }
 
-
-
-    fn set(&mut self, row: usize, col: usize, value: u32) {
+    fn push_single(&mut self, row: usize, col: usize, value: u32) {
         let idx = col * self.rows + row;
         self.offsets.push(idx as u32);
         self.values.push(value.into());
+    }
+
+    fn push_u32_bits_fast(&mut self, row: usize, col: usize, value: u32) {
+        // Use lookup table for fast bit unpacking
+        let bits = unpack_u32_bits_fast(value);
+
+        // Pre-compute base indices and batch insert
+        let base_offset = col * self.rows + row;
+        let row_stride = self.rows;
+
+        for (i, &bit) in bits.iter().enumerate() {
+            let idx = base_offset + i * row_stride;
+            self.offsets.push(idx as u32);
+            self.values.push(bit.into());
+        }
+    }
+
+    fn push_batch(&mut self, row: usize, cols: &[usize], values: &[u32]) {
+        // Batch insert multiple values efficiently
+        let base_row = row;
+        for (&col, &value) in zip(cols, values) {
+            let idx = col * self.rows + base_row;
+            self.offsets.push(idx as u32);
+            self.values.push(value.into());
+        }
     }
 }
 
