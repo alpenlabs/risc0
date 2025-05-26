@@ -26,7 +26,7 @@ use std::iter::zip;
 use anyhow::{Context, Result};
 use preflight::PreflightTrace;
 use risc0_binfmt::WordAddr;
-use risc0_circuit_rv32im_sys::RawPreflightCycle;
+
 use risc0_core::scope;
 use risc0_zkp::{
     core::digest::DIGEST_WORDS,
@@ -50,6 +50,8 @@ use crate::{
         REGCOUNT_DATA, REGCOUNT_GLOBAL, REGCOUNT_MIX,
     },
 };
+
+use rayon::prelude::*;
 
 pub(crate) struct WitnessGenerator<H: Hal> {
     cycles: usize,
@@ -138,86 +140,111 @@ where
             MetaBuffer::new("data", hal, cycles, REGCOUNT_DATA, true)
         );
 
-        // Set stateful columns from 'top'
-        let mut injector = Injector::new(cycles);
-        for (row, back) in trace.backs.iter().enumerate() {
-            let cycle = &trace.cycles[row];
-            // tracing::trace!(
-            //     "[{row}] pc: {:#010x}, state: {:?}",
-            //     cycle.pc,
-            //     crate::execute::CycleState::from_u32(cycle.state).unwrap()
-            // );
-            match back {
-                Back::None => {}
-                Back::Ecall(s0, s1, s2) => {
-                    const ECALL_S0: usize = LAYOUT_TOP.inst_result.arm8.s0._super.offset;
-                    const ECALL_S1: usize = LAYOUT_TOP.inst_result.arm8.s1._super.offset;
-                    const ECALL_S2: usize = LAYOUT_TOP.inst_result.arm8.s2._super.offset;
-                    injector.set(row, ECALL_S0, *s0);
-                    injector.set(row, ECALL_S1, *s1);
-                    injector.set(row, ECALL_S2, *s2);
-                }
-                Back::Poseidon2(p2_state) => {
-                    // Batch Poseidon2 state updates for better performance
-                    let offsets = Poseidon2State::offsets();
-                    let values = p2_state.as_array();
+        // Set stateful columns from 'top' - parallel processing
+        let injector_data: Vec<(usize, Vec<u32>, Vec<Val>)> = trace.backs.par_iter().enumerate()
+            .map(|(row, back)| {
+                let cycle = &trace.cycles[row];
+                let mut offsets: Vec<u32> = Vec::new();
+                let mut values: Vec<Val> = Vec::new();
 
-                    // Reserve capacity for all Poseidon2 elements at once
-                    injector.offsets.reserve(offsets.len());
-                    injector.values.reserve(values.len());
+                // Process the specific back type
+                match back {
+                    Back::None => {}
+                    Back::Ecall(s0, s1, s2) => {
+                        const ECALL_S0: usize = LAYOUT_TOP.inst_result.arm8.s0._super.offset;
+                        const ECALL_S1: usize = LAYOUT_TOP.inst_result.arm8.s1._super.offset;
+                        const ECALL_S2: usize = LAYOUT_TOP.inst_result.arm8.s2._super.offset;
 
-                    // Batch compute and push all updates
-                    for (&col, &value) in zip(&offsets, &values) {
-                        let idx = col * injector.rows + row;
-                        injector.offsets.push(idx as u32);
-                        injector.values.push(value.into());
+                        let idx_s0 = (ECALL_S0 * cycles + row) as u32;
+                        let idx_s1 = (ECALL_S1 * cycles + row) as u32;
+                        let idx_s2 = (ECALL_S2 * cycles + row) as u32;
+
+                        offsets.extend([idx_s0, idx_s1, idx_s2]);
+                        values.push((*s0).into());
+                        values.push((*s1).into());
+                        values.push((*s2).into());
                     }
-                }
-                Back::Sha2(sha2_state) => {
-                    // Batch SHA2 FP state updates
-                    let fp_offsets = Sha2State::fp_offsets();
-                    let fp_values = sha2_state.fp_array();
+                    Back::Poseidon2(p2_state) => {
+                        let p2_offsets = Poseidon2State::offsets();
+                        let p2_values = p2_state.as_array();
 
-                    injector.offsets.reserve(fp_offsets.len());
-                    injector.values.reserve(fp_values.len());
-
-                    for (&col, &value) in zip(&fp_offsets, &fp_values) {
-                        let idx = col * injector.rows + row;
-                        injector.offsets.push(idx as u32);
-                        injector.values.push(value.into());
+                        for (&col, &value) in zip(&p2_offsets, &p2_values) {
+                            let idx = (col * cycles + row) as u32;
+                            offsets.push(idx);
+                            values.push(value.into());
+                        }
                     }
+                    Back::Sha2(sha2_state) => {
+                        // SHA2 FP operations
+                        let fp_offsets = Sha2State::fp_offsets();
+                        let fp_values = sha2_state.fp_array();
 
-                    // Batch SHA2 U32 bit operations
-                    let u32_offsets = Sha2State::u32_offsets();
-                    let u32_values = sha2_state.u32_array();
+                        for (&col, &value) in zip(&fp_offsets, &fp_values) {
+                            let idx = (col * cycles + row) as u32;
+                            offsets.push(idx);
+                            values.push(value.into());
+                        }
 
-                    injector.offsets.reserve(u32_offsets.len() * 32);
-                    injector.values.reserve(u32_values.len() * 32);
+                        // SHA2 U32 bit operations
+                        let u32_offsets = Sha2State::u32_offsets();
+                        let u32_values = sha2_state.u32_array();
 
-                    for (&col, &value) in zip(&u32_offsets, &u32_values) {
-                        for i in 0..32 {
-                            let idx = (col + i) * injector.rows + row;
-                            injector.offsets.push(idx as u32);
-                            injector.values.push(((value >> i) & 1).into());
+                        for (&col, &value) in zip(&u32_offsets, &u32_values) {
+                            for i in 0..32 {
+                                let idx = ((col + i) * cycles + row) as u32;
+                                offsets.push(idx);
+                                values.push(((value >> i) & 1).into());
+                            }
+                        }
+                    }
+                    Back::BigInt(state) => {
+                        let bigint_offsets = BigIntState::offsets();
+                        let bigint_values = state.as_array();
+
+                        for (&col, &value) in zip(&bigint_offsets, &bigint_values) {
+                            let idx = (col * cycles + row) as u32;
+                            offsets.push(idx);
+                            values.push(value.into());
                         }
                     }
                 }
-                Back::BigInt(state) => {
-                    // Batch BigInt state updates
-                    let offsets = BigIntState::offsets();
-                    let values = state.as_array();
 
-                    injector.offsets.reserve(offsets.len());
-                    injector.values.reserve(values.len());
+                // Add cycle data
+                const CYCLE_COL: usize = LAYOUT_TOP.cycle._super.offset;
+                const NEXT_PC_LOW: usize = LAYOUT_TOP.next_pc_low._super.offset;
+                const NEXT_PC_HIGH: usize = LAYOUT_TOP.next_pc_high._super.offset;
+                const NEXT_STATE: usize = LAYOUT_TOP.next_state_0._super.offset;
+                const NEXT_MACHINE_MODE: usize = LAYOUT_TOP.next_machine_mode._super.offset;
 
-                    for (&col, &value) in zip(&offsets, &values) {
-                        let idx = col * injector.rows + row;
-                        injector.offsets.push(idx as u32);
-                        injector.values.push(value.into());
-                    }
-                }
-            }
-            injector.set_cycle(row, cycle);
+                let cycle_offsets = [
+                    (CYCLE_COL * cycles + row) as u32,
+                    (NEXT_PC_LOW * cycles + row) as u32,
+                    (NEXT_PC_HIGH * cycles + row) as u32,
+                    (NEXT_STATE * cycles + row) as u32,
+                    (NEXT_MACHINE_MODE * cycles + row) as u32,
+                ];
+
+                let cycle_values = [
+                    Val::from(row as u32),
+                    Val::from(cycle.pc & 0xffff),
+                    Val::from(cycle.pc >> 16),
+                    Val::from(cycle.state),
+                    Val::from(cycle.machine_mode as u32),
+                ];
+
+                offsets.extend(cycle_offsets);
+                values.extend(cycle_values);
+
+                (row, offsets, values)
+            })
+            .collect();
+
+        // Merge parallel results into injector
+        let mut injector = Injector::new(cycles);
+        for (row, row_offsets, row_values) in injector_data {
+            injector.offsets.extend(row_offsets);
+            injector.values.extend(row_values);
+            injector.push();
         }
 
         hal.scatter(
@@ -359,19 +386,7 @@ impl Injector {
         self.index.push(self.offsets.len() as u32);
     }
 
-    fn set_cycle(&mut self, row: usize, cycle: &RawPreflightCycle) {
-        const CYCLE_COL: usize = LAYOUT_TOP.cycle._super.offset;
-        const NEXT_PC_LOW: usize = LAYOUT_TOP.next_pc_low._super.offset;
-        const NEXT_PC_HIGH: usize = LAYOUT_TOP.next_pc_high._super.offset;
-        const NEXT_STATE: usize = LAYOUT_TOP.next_state_0._super.offset;
-        const NEXT_MACHINE_MODE: usize = LAYOUT_TOP.next_machine_mode._super.offset;
-        self.set(row, CYCLE_COL, row as u32);
-        self.set(row, NEXT_PC_LOW, cycle.pc & 0xffff);
-        self.set(row, NEXT_PC_HIGH, cycle.pc >> 16);
-        self.set(row, NEXT_STATE, cycle.state);
-        self.set(row, NEXT_MACHINE_MODE, cycle.machine_mode as u32);
-        self.push();
-    }
+
 
     fn set(&mut self, row: usize, col: usize, value: u32) {
         let idx = col * self.rows + row;
