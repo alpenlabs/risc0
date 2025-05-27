@@ -28,7 +28,7 @@ deadpool-redis = "0.15"
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 redis = { version = "0.25", features = ["tokio-comp"] }
 risc0-build = { path = "../risc0/build" }
-risc0-zkvm = { path = "../risc0/zkvm", default-features = false }
+risc0-zkvm = { version = "2.0.2", default-features = false }
 sample-guest-common = { path = "crates/sample-guest/common" }
 sample-guest-methods = { path = "crates/sample-guest/methods" }
 serde = { version = "1.0", features = ["derive"] }
