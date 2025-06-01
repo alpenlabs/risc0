@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
     };
 
     // first round -- only iter
-    let (_session_uuid, receipt_id) =
+    let (session_uuid, receipt_id) =
         stark_workflow(&client, image.clone(), input, vec![], args.exec_only).await?;
 
     // return if exec only and success
