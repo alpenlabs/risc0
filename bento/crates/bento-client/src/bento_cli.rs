@@ -44,6 +44,10 @@ pub struct Args {
     /// Bento HTTP API Endpoint
     #[clap(short = 't', long, default_value = "http://localhost:8081")]
     endpoint: String,
+
+    /// path to store the generated receipt
+    #[clap(short = 'o', long, default_value = "/tmp/receipt.bin")]
+    receipt_output: PathBuf,
 }
 
 #[tokio::main]
@@ -74,7 +78,7 @@ async fn main() -> Result<()> {
 
     // first round -- only iter
     let (session_uuid, receipt_id) =
-        stark_workflow(&client, image.clone(), input, vec![], args.exec_only).await?;
+        stark_workflow(&client, image.clone(), input, vec![], args.exec_only, args.receipt_output.clone()).await?;
 
     // return if exec only and success
     if args.exec_only {
@@ -92,7 +96,7 @@ async fn main() -> Result<()> {
 
     // snarkify
     if args.snarkify {
-        stark_2_snark(session_uuid, client).await?;
+        stark_2_snark(session_uuid, client, args.receipt_output.clone()).await?;
     }
 
     Ok(())
@@ -104,6 +108,7 @@ async fn stark_workflow(
     input: Vec<u8>,
     assumptions: Vec<String>,
     exec_only: bool,
+    receipt_output: PathBuf,
 ) -> Result<(String, String)> {
     // elf/image
     let image_id = compute_image_id(&image).unwrap();
@@ -152,6 +157,14 @@ async fn stark_workflow(
                     .await
                     .context("Failed to download receipt")?;
 
+                // save the recipt_bytes to a file at the path suppllied by the user
+                let mut stark_receipt_output = receipt_output.clone();
+                stark_receipt_output.set_extension("stark");
+                std::fs::write(&stark_receipt_output, &receipt_bytes)
+                    .context("Failed to write receipt to file")?;
+                tracing::info!("Receipt bytes written to {:?}", stark_receipt_output);
+
+                // verify the receipt
                 let receipt: Receipt = bincode::deserialize(&receipt_bytes).unwrap();
                 receipt.verify(image_id).unwrap();
 
@@ -173,7 +186,7 @@ async fn stark_workflow(
     Ok((session.uuid, receipt_id))
 }
 
-async fn stark_2_snark(session_id: String, client: ProvingClient) -> Result<()> {
+async fn stark_2_snark(session_id: String, client: ProvingClient, receipt_output: PathBuf) -> Result<()> {
     tracing::info!("STARK 2 SNARK job_id: {}", session_id);
     let snark_session = client
         .create_snark(session_id)
@@ -193,10 +206,19 @@ async fn stark_2_snark(session_id: String, client: ProvingClient) -> Result<()> 
             "SUCCEEDED" => {
                 tracing::info!("Job done!");
 
-                let _receipt = client
+                let receipt = client
                     .download(&res.output.context("SNARK missing output URL")?)
                     .await
                     .context("Failed to download snark receipt")?;
+
+
+                // save the receipt to a file at the path supplied by the user
+                let mut snark_receipt_output = receipt_output.clone();
+                snark_receipt_output.set_extension("snark");
+                std::fs::write(&snark_receipt_output, &receipt)
+                    .context("Failed to write receipt to file")?;
+                tracing::info!("Receipt bytes written to {:?}", snark_receipt_output);
+
                 break;
             }
             _ => {
