@@ -7,7 +7,6 @@ use bonsai_sdk::non_blocking::Client as ProvingClient;
 use clap::Parser;
 use risc0_zkvm::{compute_image_id, serde::to_vec, Receipt};
 use sample_guest_common::IterReq;
-use sample_guest_methods::METHOD_NAME_ID;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -77,7 +76,7 @@ async fn main() -> Result<()> {
     };
 
     // first round -- only iter
-    let (session_uuid, receipt_id) =
+    let (session_uuid, _receipt_id) =
         stark_workflow(&client, image.clone(), input, vec![], args.exec_only, args.receipt_output.clone()).await?;
 
     // return if exec only and success
@@ -96,7 +95,7 @@ async fn main() -> Result<()> {
 
     // snarkify
     if args.snarkify {
-        stark_2_snark(session_uuid, client, args.receipt_output.clone()).await?;
+        stark_2_snark(session_uuid, client, image.clone(), args.receipt_output.clone()).await?;
     }
 
     Ok(())
@@ -185,8 +184,15 @@ async fn stark_workflow(
     }
     Ok((session.uuid, receipt_id))
 }
+async fn stark_2_snark(
+    session_id: String,
+    client: ProvingClient,
+    image: Vec<u8>,
+    receipt_output: PathBuf,
+) -> Result<()> {
 
-async fn stark_2_snark(session_id: String, client: ProvingClient, receipt_output: PathBuf) -> Result<()> {
+    let image_id = compute_image_id(&image).unwrap();
+
     tracing::info!("STARK 2 SNARK job_id: {}", session_id);
     let snark_session = client
         .create_snark(session_id)
@@ -206,7 +212,7 @@ async fn stark_2_snark(session_id: String, client: ProvingClient, receipt_output
             "SUCCEEDED" => {
                 tracing::info!("Job done!");
 
-                let receipt = client
+                let receipt_bytes = client
                     .download(&res.output.context("SNARK missing output URL")?)
                     .await
                     .context("Failed to download snark receipt")?;
@@ -215,10 +221,13 @@ async fn stark_2_snark(session_id: String, client: ProvingClient, receipt_output
                 // save the receipt to a file at the path supplied by the user
                 let mut snark_receipt_output = receipt_output.clone();
                 snark_receipt_output.set_extension("snark");
-                std::fs::write(&snark_receipt_output, &receipt)
+                std::fs::write(&snark_receipt_output, &receipt_bytes)
                     .context("Failed to write receipt to file")?;
                 tracing::info!("Receipt bytes written to {:?}", snark_receipt_output);
 
+                // verify the receipt
+                let receipt: Receipt = bincode::deserialize(&receipt_bytes).unwrap();
+                receipt.verify(image_id).unwrap();
                 break;
             }
             _ => {
